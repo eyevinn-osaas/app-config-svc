@@ -6,10 +6,15 @@ const redisUrl = new URL(process.env.REDIS_URL || 'redis://localhost:6379');
 const defaultCacheAge = process.env.DEFAULT_CACHE_AGE
   ? Number(process.env.DEFAULT_CACHE_AGE)
   : undefined;
+const encryptionKey = process.env.PARAMETER_ENCRYPTION_KEY;
+const configApiKey = process.env.CONFIG_API_KEY;
+
 const server = api({
   title: 'Application Configuration Service API',
   redisUrl,
-  defaultCacheAge
+  defaultCacheAge,
+  encryptionKey,
+  configApiKey
 });
 
 server.register(fastifyStatic, {

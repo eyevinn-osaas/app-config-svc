@@ -1,5 +1,10 @@
 import api from './api';
 import { KEY_PREFIX } from './api_config';
+import { encrypt } from './crypto';
+import { randomBytes } from 'crypto';
+
+// Fixed test encryption key (256-bit, base64)
+const TEST_ENCRYPTION_KEY = randomBytes(32).toString('base64');
 
 const mockRedis = {
   set: jest.fn().mockResolvedValue('OK'),
@@ -15,15 +20,31 @@ jest.mock('ioredis', () => {
   };
 });
 
+const TEST_CONFIG_API_KEY = 'test-api-key';
+
+function makeServer() {
+  return api({
+    title: 'test',
+    redisUrl: new URL('redis://localhost:6379'),
+    encryptionKey: TEST_ENCRYPTION_KEY,
+    configApiKey: TEST_CONFIG_API_KEY
+  });
+}
+
+function makeServerNoEncryption() {
+  return api({
+    title: 'test',
+    redisUrl: new URL('redis://localhost:6379')
+    // encryptionKey and configApiKey intentionally omitted
+  });
+}
+
 describe('api_config key prefix isolation', () => {
-  let server: ReturnType<typeof api>;
+  let server: ReturnType<typeof makeServer>;
 
   beforeEach(() => {
     jest.clearAllMocks();
-    server = api({
-      title: 'test',
-      redisUrl: new URL('redis://localhost:6379')
-    });
+    server = makeServer();
   });
 
   describe('POST /api/v1/config', () => {
@@ -55,6 +76,136 @@ describe('api_config key prefix isolation', () => {
       const body = JSON.parse(response.body);
       expect(body.key).toBe('mykey');
     });
+
+    it('stores a secret parameter as an encrypted JSON envelope', async () => {
+      mockRedis.set.mockResolvedValue('OK');
+
+      const response = await server.inject({
+        method: 'POST',
+        url: '/api/v1/config',
+        payload: { key: 'secretkey', value: 'topsecret', secret: true }
+      });
+
+      expect(response.statusCode).toBe(200);
+
+      // The stored value must be a JSON envelope, not the raw plaintext
+      const [, storedValue] = mockRedis.set.mock.calls[0] as [string, string];
+      const envelope = JSON.parse(storedValue);
+      expect(envelope.secret).toBe(true);
+      expect(envelope.value).toBeDefined();
+      expect(envelope.iv).toBeDefined();
+      expect(envelope.tag).toBeDefined();
+      // Raw plaintext must NOT be stored
+      expect(storedValue).not.toContain('topsecret');
+    });
+
+    it('returns *** for secret value in response', async () => {
+      mockRedis.set.mockResolvedValue('OK');
+
+      const response = await server.inject({
+        method: 'POST',
+        url: '/api/v1/config',
+        payload: { key: 'secretkey', value: 'topsecret', secret: true }
+      });
+
+      const body = JSON.parse(response.body);
+      expect(body.value).toBe('***');
+      expect(body.secret).toBe(true);
+    });
+  });
+
+  describe('PUT /api/v1/config/:key', () => {
+    it('updates a non-secret parameter value', async () => {
+      mockRedis.get.mockResolvedValue('oldvalue');
+      mockRedis.set.mockResolvedValue('OK');
+
+      const response = await server.inject({
+        method: 'PUT',
+        url: '/api/v1/config/mykey',
+        payload: { value: 'newvalue' }
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = JSON.parse(response.body);
+      expect(body.key).toBe('mykey');
+      expect(body.value).toBe('newvalue');
+    });
+
+    it('re-encrypts a secret parameter on update', async () => {
+      // Simulate existing secret envelope in redis
+      const existingEnvelope = JSON.stringify({
+        value: encrypt('oldsecret', TEST_ENCRYPTION_KEY).encrypted,
+        iv: encrypt('oldsecret', TEST_ENCRYPTION_KEY).iv,
+        tag: encrypt('oldsecret', TEST_ENCRYPTION_KEY).tag,
+        secret: true
+      });
+      mockRedis.get.mockResolvedValue(existingEnvelope);
+      mockRedis.set.mockResolvedValue('OK');
+
+      const response = await server.inject({
+        method: 'PUT',
+        url: '/api/v1/config/secretkey',
+        payload: { value: 'newsecret' }
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = JSON.parse(response.body);
+      expect(body.value).toBe('***');
+      expect(body.secret).toBe(true);
+
+      // Stored value must be a new envelope, not plaintext
+      const [, storedValue] = mockRedis.set.mock.calls[0] as [string, string];
+      const envelope = JSON.parse(storedValue);
+      expect(envelope.secret).toBe(true);
+      expect(storedValue).not.toContain('newsecret');
+    });
+
+    it('allows converting a non-secret to secret', async () => {
+      mockRedis.get.mockResolvedValue('plainvalue');
+      mockRedis.set.mockResolvedValue('OK');
+
+      const response = await server.inject({
+        method: 'PUT',
+        url: '/api/v1/config/mykey',
+        payload: { value: 'newvalue', secret: true }
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = JSON.parse(response.body);
+      expect(body.value).toBe('***');
+      expect(body.secret).toBe(true);
+    });
+
+    it('rejects converting a secret to non-secret (400)', async () => {
+      const { encrypted, iv, tag } = encrypt('topsecret', TEST_ENCRYPTION_KEY);
+      const existingEnvelope = JSON.stringify({
+        value: encrypted,
+        iv,
+        tag,
+        secret: true
+      });
+      mockRedis.get.mockResolvedValue(existingEnvelope);
+
+      const response = await server.inject({
+        method: 'PUT',
+        url: '/api/v1/config/secretkey',
+        payload: { value: 'plainvalue', secret: false }
+      });
+
+      expect(response.statusCode).toBe(400);
+    });
+
+    it('returns 404 when key does not exist', async () => {
+      mockRedis.get.mockResolvedValue(null);
+
+      const response = await server.inject({
+        method: 'PUT',
+        url: '/api/v1/config/nokey',
+        payload: { value: 'v' }
+      });
+
+      expect(response.statusCode).toBe(404);
+    });
   });
 
   describe('GET /api/v1/config/:key', () => {
@@ -81,6 +232,41 @@ describe('api_config key prefix isolation', () => {
       const body = JSON.parse(response.body);
       expect(body.key).toBe('mykey');
       expect(body.value).toBe('myvalue');
+    });
+
+    it('returns *** for secret values without auth', async () => {
+      const { encrypted, iv, tag } = encrypt('topsecret', TEST_ENCRYPTION_KEY);
+      mockRedis.get.mockResolvedValue(
+        JSON.stringify({ value: encrypted, iv, tag, secret: true })
+      );
+
+      const response = await server.inject({
+        method: 'GET',
+        url: '/api/v1/config/secretkey'
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = JSON.parse(response.body);
+      expect(body.value).toBe('***');
+      expect(body.secret).toBe(true);
+    });
+
+    it('returns plaintext for secret values with valid x-config-api-key header', async () => {
+      const { encrypted, iv, tag } = encrypt('topsecret', TEST_ENCRYPTION_KEY);
+      mockRedis.get.mockResolvedValue(
+        JSON.stringify({ value: encrypted, iv, tag, secret: true })
+      );
+
+      const response = await server.inject({
+        method: 'GET',
+        url: '/api/v1/config/secretkey',
+        headers: { 'x-config-api-key': TEST_CONFIG_API_KEY }
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = JSON.parse(response.body);
+      expect(body.value).toBe('topsecret');
+      expect(body.secret).toBe(true);
     });
 
     it('returns 404 when key does not exist', async () => {
@@ -267,5 +453,147 @@ describe('api_config key prefix isolation', () => {
       );
       expect(mockRedis.del).toHaveBeenCalledWith('legacykey');
     });
+
+    it('masks secret values in listing when unauthenticated', async () => {
+      const { encrypted, iv, tag } = encrypt('topsecret', TEST_ENCRYPTION_KEY);
+      const envelope = JSON.stringify({
+        value: encrypted,
+        iv,
+        tag,
+        secret: true
+      });
+
+      mockRedis.scan
+        .mockResolvedValueOnce(['0', [KEY_PREFIX + 'secretkey']])
+        .mockResolvedValueOnce(['0', []]);
+      mockRedis.keys.mockResolvedValue([KEY_PREFIX + 'secretkey']);
+      mockRedis.get.mockResolvedValue(envelope);
+
+      const response = await server.inject({
+        method: 'GET',
+        url: '/api/v1/config'
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = JSON.parse(response.body);
+      const item = body.items.find(
+        (i: { key: string }) => i.key === 'secretkey'
+      );
+      expect(item.value).toBe('***');
+      expect(item.secret).toBe(true);
+    });
+
+    it('returns plaintext in listing with valid x-config-api-key header', async () => {
+      const { encrypted, iv, tag } = encrypt('topsecret', TEST_ENCRYPTION_KEY);
+      const envelope = JSON.stringify({
+        value: encrypted,
+        iv,
+        tag,
+        secret: true
+      });
+
+      mockRedis.scan
+        .mockResolvedValueOnce(['0', [KEY_PREFIX + 'secretkey']])
+        .mockResolvedValueOnce(['0', []]);
+      mockRedis.keys.mockResolvedValue([KEY_PREFIX + 'secretkey']);
+      mockRedis.get.mockResolvedValue(envelope);
+
+      const response = await server.inject({
+        method: 'GET',
+        url: '/api/v1/config',
+        headers: { 'x-config-api-key': TEST_CONFIG_API_KEY }
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = JSON.parse(response.body);
+      const item = body.items.find(
+        (i: { key: string }) => i.key === 'secretkey'
+      );
+      expect(item.value).toBe('topsecret');
+    });
+  });
+});
+
+describe('api_config without encryption keys (backward compatibility)', () => {
+  let server: ReturnType<typeof makeServerNoEncryption>;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    server = makeServerNoEncryption();
+  });
+
+  it('starts and serves non-secret parameters without PARAMETER_ENCRYPTION_KEY', async () => {
+    mockRedis.set.mockResolvedValue('OK');
+
+    const response = await server.inject({
+      method: 'POST',
+      url: '/api/v1/config',
+      payload: { key: 'mykey', value: 'myvalue' }
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = JSON.parse(response.body);
+    expect(body.key).toBe('mykey');
+    expect(body.value).toBe('myvalue');
+  });
+
+  it('returns 400 when POST requests secret:true without PARAMETER_ENCRYPTION_KEY', async () => {
+    const response = await server.inject({
+      method: 'POST',
+      url: '/api/v1/config',
+      payload: { key: 'secretkey', value: 'topsecret', secret: true }
+    });
+
+    expect(response.statusCode).toBe(400);
+    const body = JSON.parse(response.body);
+    expect(body.reason).toMatch(/PARAMETER_ENCRYPTION_KEY/);
+  });
+
+  it('returns 400 when PUT upgrades to secret without PARAMETER_ENCRYPTION_KEY', async () => {
+    mockRedis.get.mockResolvedValue('plainvalue');
+
+    const response = await server.inject({
+      method: 'PUT',
+      url: '/api/v1/config/mykey',
+      payload: { value: 'newvalue', secret: true }
+    });
+
+    expect(response.statusCode).toBe(400);
+    const body = JSON.parse(response.body);
+    expect(body.reason).toMatch(/PARAMETER_ENCRYPTION_KEY/);
+  });
+
+  it('returns 400 when PUT re-encrypts an existing secret without PARAMETER_ENCRYPTION_KEY', async () => {
+    // Simulate a secret envelope that was stored when the key was configured
+    const envelope = JSON.stringify({
+      value: 'encryptedblob',
+      iv: 'ivblob',
+      tag: 'tagblob',
+      secret: true
+    });
+    mockRedis.get.mockResolvedValue(envelope);
+
+    const response = await server.inject({
+      method: 'PUT',
+      url: '/api/v1/config/secretkey',
+      payload: { value: 'newsecret' }
+    });
+
+    expect(response.statusCode).toBe(400);
+    const body = JSON.parse(response.body);
+    expect(body.reason).toMatch(/PARAMETER_ENCRYPTION_KEY/);
+  });
+
+  it('returns masked value for plain GET without keys configured', async () => {
+    mockRedis.get.mockResolvedValue('plainvalue');
+
+    const response = await server.inject({
+      method: 'GET',
+      url: '/api/v1/config/mykey'
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = JSON.parse(response.body);
+    expect(body.value).toBe('plainvalue');
   });
 });

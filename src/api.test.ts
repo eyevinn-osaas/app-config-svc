@@ -18,7 +18,9 @@ describe('api', () => {
   it('responds with hello, world!', async () => {
     const server = api({
       title: 'my awesome service',
-      redisUrl: new URL('redis://localhost:6379')
+      redisUrl: new URL('redis://localhost:6379'),
+      encryptionKey: Buffer.alloc(32).toString('base64'),
+      configApiKey: 'test-api-key'
     });
     const response = await server.inject({
       method: 'GET',
