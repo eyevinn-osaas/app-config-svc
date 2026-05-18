@@ -3,15 +3,24 @@ import { KEY_PREFIX } from './api_config';
 import { encrypt } from './crypto';
 import { randomBytes } from 'crypto';
 
+// A key that decodes to 10 bytes (not a valid AES key length)
+const BAD_ENCRYPTION_KEY = randomBytes(10).toString('base64');
+
 // Fixed test encryption key (256-bit, base64)
 const TEST_ENCRYPTION_KEY = randomBytes(32).toString('base64');
+
+const mockPipeline = {
+  type: jest.fn().mockReturnThis(),
+  exec: jest.fn().mockResolvedValue([])
+};
 
 const mockRedis = {
   set: jest.fn().mockResolvedValue('OK'),
   get: jest.fn().mockResolvedValue('value'),
   del: jest.fn().mockResolvedValue(1),
   scan: jest.fn().mockResolvedValue(['0', []]),
-  keys: jest.fn().mockResolvedValue([])
+  keys: jest.fn().mockResolvedValue([]),
+  pipeline: jest.fn().mockReturnValue(mockPipeline)
 };
 
 jest.mock('ioredis', () => {
@@ -39,11 +48,23 @@ function makeServerNoEncryption() {
   });
 }
 
+function makeServerBadKey() {
+  return api({
+    title: 'test',
+    redisUrl: new URL('redis://localhost:6379'),
+    encryptionKey: BAD_ENCRYPTION_KEY,
+    configApiKey: TEST_CONFIG_API_KEY
+  });
+}
+
 describe('api_config key prefix isolation', () => {
   let server: ReturnType<typeof makeServer>;
 
   beforeEach(() => {
     jest.clearAllMocks();
+    // Default pipeline: one key, type=string (covers single-key listing tests)
+    mockPipeline.type.mockReturnThis();
+    mockPipeline.exec.mockResolvedValue([[null, 'string']]);
     server = makeServer();
   });
 
@@ -511,6 +532,221 @@ describe('api_config key prefix isolation', () => {
       );
       expect(item.value).toBe('topsecret');
     });
+
+    it('skips non-String keys (Hash/List/Set) and returns skippedKeys count', async () => {
+      // Seed: prefixedPageKeys has 2 string keys + 1 hash key
+      const stringKey1 = KEY_PREFIX + 'strkey1';
+      const stringKey2 = KEY_PREFIX + 'strkey2';
+      const hashKey = KEY_PREFIX + 'hashkey';
+
+      mockRedis.scan
+        .mockResolvedValueOnce(['0', [stringKey1, stringKey2, hashKey]]) // prefixed scan
+        .mockResolvedValueOnce(['0', []]); // all-keys scan (no bare keys)
+      mockRedis.keys.mockResolvedValue([stringKey1, stringKey2, hashKey]);
+
+      // Pipeline type check: string, string, hash
+      mockPipeline.exec.mockResolvedValueOnce([
+        [null, 'string'],
+        [null, 'string'],
+        [null, 'hash']
+      ]);
+
+      // redis.get called only for the 2 string keys
+      mockRedis.get
+        .mockResolvedValueOnce('value1')
+        .mockResolvedValueOnce('value2');
+
+      const response = await server.inject({
+        method: 'GET',
+        url: '/api/v1/config'
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = JSON.parse(response.body);
+      expect(body.items).toHaveLength(2);
+      expect(body.items.map((i: { key: string }) => i.key)).toEqual(
+        expect.arrayContaining(['strkey1', 'strkey2'])
+      );
+      expect(body.skippedKeys).toBe(1);
+      // redis.get must NOT have been called for the hash key
+      expect(mockRedis.get).toHaveBeenCalledTimes(2);
+    });
+  });
+});
+
+describe('POST /api/v1/migrate/secure', () => {
+  let server: ReturnType<typeof makeServer>;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    server = makeServer();
+  });
+
+  it('returns 401 when x-config-api-key header is missing', async () => {
+    const response = await server.inject({
+      method: 'POST',
+      url: '/api/v1/migrate/secure',
+      payload: {}
+    });
+
+    expect(response.statusCode).toBe(401);
+  });
+
+  it('returns 401 when x-config-api-key header is wrong', async () => {
+    const response = await server.inject({
+      method: 'POST',
+      url: '/api/v1/migrate/secure',
+      payload: {},
+      headers: { 'x-config-api-key': 'wrong-key' }
+    });
+
+    expect(response.statusCode).toBe(401);
+  });
+
+  it('returns 400 when PARAMETER_ENCRYPTION_KEY is not configured', async () => {
+    const serverNoEnc = api({
+      title: 'test',
+      redisUrl: new URL('redis://localhost:6379'),
+      configApiKey: TEST_CONFIG_API_KEY
+      // encryptionKey intentionally omitted
+    });
+
+    const response = await serverNoEnc.inject({
+      method: 'POST',
+      url: '/api/v1/migrate/secure',
+      payload: {},
+      headers: { 'x-config-api-key': TEST_CONFIG_API_KEY }
+    });
+
+    expect(response.statusCode).toBe(400);
+    const body = JSON.parse(response.body);
+    expect(body.reason).toMatch(/PARAMETER_ENCRYPTION_KEY/);
+  });
+
+  it('migrates plaintext keys to encrypted envelopes', async () => {
+    // SCAN returns two prefixed keys
+    mockRedis.scan.mockResolvedValueOnce([
+      '0',
+      [KEY_PREFIX + 'key1', KEY_PREFIX + 'key2']
+    ]);
+    // Both values are plaintext
+    mockRedis.get
+      .mockResolvedValueOnce('value1')
+      .mockResolvedValueOnce('value2');
+    mockRedis.set.mockResolvedValue('OK');
+
+    const response = await server.inject({
+      method: 'POST',
+      url: '/api/v1/migrate/secure',
+      payload: {},
+      headers: { 'x-config-api-key': TEST_CONFIG_API_KEY }
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = JSON.parse(response.body);
+    expect(body.migrated).toEqual(expect.arrayContaining(['key1', 'key2']));
+    expect(body.skipped).toEqual([]);
+    expect(body.dryRun).toBe(false);
+
+    // redis.set must have been called twice (once per key)
+    expect(mockRedis.set).toHaveBeenCalledTimes(2);
+
+    // Stored value for key1 must be a valid encrypted envelope
+    const [, storedValue1] = mockRedis.set.mock.calls[0] as [string, string];
+    const envelope1 = JSON.parse(storedValue1);
+    expect(envelope1.secret).toBe(true);
+    expect(envelope1.value).toBeDefined();
+    expect(envelope1.iv).toBeDefined();
+    expect(envelope1.tag).toBeDefined();
+    expect(storedValue1).not.toContain('value1');
+  });
+
+  it('skips keys that are already encrypted envelopes', async () => {
+    const { encrypted, iv, tag } = encrypt('topsecret', TEST_ENCRYPTION_KEY);
+    const existingEnvelope = JSON.stringify({
+      value: encrypted,
+      iv,
+      tag,
+      secret: true
+    });
+
+    mockRedis.scan.mockResolvedValueOnce([
+      '0',
+      [KEY_PREFIX + 'plain', KEY_PREFIX + 'secret']
+    ]);
+    mockRedis.get
+      .mockResolvedValueOnce('plaintext') // plain key
+      .mockResolvedValueOnce(existingEnvelope); // secret key
+    mockRedis.set.mockResolvedValue('OK');
+
+    const response = await server.inject({
+      method: 'POST',
+      url: '/api/v1/migrate/secure',
+      payload: {},
+      headers: { 'x-config-api-key': TEST_CONFIG_API_KEY }
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = JSON.parse(response.body);
+    expect(body.migrated).toEqual(['plain']);
+    expect(body.skipped).toEqual(['secret']);
+    expect(body.dryRun).toBe(false);
+
+    // Only the plaintext key should be written
+    expect(mockRedis.set).toHaveBeenCalledTimes(1);
+    expect(mockRedis.set.mock.calls[0][0]).toBe(KEY_PREFIX + 'plain');
+  });
+
+  it('dryRun=true returns correct lists but makes no writes to Redis', async () => {
+    mockRedis.scan.mockResolvedValueOnce([
+      '0',
+      [KEY_PREFIX + 'key1', KEY_PREFIX + 'key2']
+    ]);
+    mockRedis.get
+      .mockResolvedValueOnce('value1')
+      .mockResolvedValueOnce('value2');
+
+    const response = await server.inject({
+      method: 'POST',
+      url: '/api/v1/migrate/secure',
+      payload: { dryRun: true },
+      headers: { 'x-config-api-key': TEST_CONFIG_API_KEY }
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = JSON.parse(response.body);
+    expect(body.migrated).toEqual(expect.arrayContaining(['key1', 'key2']));
+    expect(body.skipped).toEqual([]);
+    expect(body.dryRun).toBe(true);
+
+    // No writes should have occurred
+    expect(mockRedis.set).not.toHaveBeenCalled();
+  });
+
+  it('migrates only specified keys when keys array is provided', async () => {
+    // Only key1 is requested — key2 is NOT in the request
+    mockRedis.get.mockResolvedValueOnce('value1'); // for KEY_PREFIX + 'key1'
+    mockRedis.set.mockResolvedValue('OK');
+
+    const response = await server.inject({
+      method: 'POST',
+      url: '/api/v1/migrate/secure',
+      payload: { keys: ['key1'] },
+      headers: { 'x-config-api-key': TEST_CONFIG_API_KEY }
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = JSON.parse(response.body);
+    expect(body.migrated).toEqual(['key1']);
+    expect(body.skipped).toEqual([]);
+    expect(body.dryRun).toBe(false);
+
+    // SCAN must NOT have been called (explicit key list was provided)
+    expect(mockRedis.scan).not.toHaveBeenCalled();
+
+    // Only key1 should have been written
+    expect(mockRedis.set).toHaveBeenCalledTimes(1);
+    expect(mockRedis.set.mock.calls[0][0]).toBe(KEY_PREFIX + 'key1');
   });
 });
 
@@ -595,5 +831,70 @@ describe('api_config without encryption keys (backward compatibility)', () => {
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body);
     expect(body.value).toBe('plainvalue');
+  });
+});
+
+describe('api_config with invalid encryption key (RangeError protection)', () => {
+  let server: ReturnType<typeof makeServerBadKey>;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockPipeline.type.mockReturnThis();
+    mockPipeline.exec.mockResolvedValue([[null, 'string']]);
+    server = makeServerBadKey();
+  });
+
+  it('POST /api/v1/config returns HTTP 400 with actionable reason when key is invalid', async () => {
+    mockRedis.set.mockResolvedValue('OK');
+
+    const response = await server.inject({
+      method: 'POST',
+      url: '/api/v1/config',
+      payload: { key: 'secretkey', value: 'topsecret', secret: true }
+    });
+
+    expect(response.statusCode).toBe(400);
+    const body = JSON.parse(response.body);
+    expect(body.reason).toMatch(/encryption key is invalid/);
+    expect(body.reason).toMatch(/setup-parameter-store/);
+  });
+
+  it('PUT /api/v1/config/:key returns HTTP 400 with actionable reason when key is invalid', async () => {
+    // Existing envelope that triggers the re-encrypt path
+    const envelope = JSON.stringify({
+      value: 'encryptedblob',
+      iv: Buffer.alloc(12).toString('base64'),
+      tag: Buffer.alloc(16).toString('base64'),
+      secret: true
+    });
+    mockRedis.get.mockResolvedValue(envelope);
+
+    const response = await server.inject({
+      method: 'PUT',
+      url: '/api/v1/config/secretkey',
+      payload: { value: 'newsecret' }
+    });
+
+    expect(response.statusCode).toBe(400);
+    const body = JSON.parse(response.body);
+    expect(body.reason).toMatch(/encryption key is invalid/);
+    expect(body.reason).toMatch(/setup-parameter-store/);
+  });
+
+  it('POST /api/v1/migrate/secure returns HTTP 400 with actionable reason when key is invalid', async () => {
+    mockRedis.scan.mockResolvedValueOnce(['0', [KEY_PREFIX + 'plainkey']]);
+    mockRedis.get.mockResolvedValueOnce('plainvalue');
+
+    const response = await server.inject({
+      method: 'POST',
+      url: '/api/v1/migrate/secure',
+      payload: {},
+      headers: { 'x-config-api-key': TEST_CONFIG_API_KEY }
+    });
+
+    expect(response.statusCode).toBe(400);
+    const body = JSON.parse(response.body);
+    expect(body.reason).toMatch(/encryption key is invalid/);
+    expect(body.reason).toMatch(/setup-parameter-store/);
   });
 });

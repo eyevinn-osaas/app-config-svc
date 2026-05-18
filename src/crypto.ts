@@ -2,6 +2,15 @@ import { createCipheriv, createDecipheriv, randomBytes } from 'crypto';
 
 const ALGORITHM = 'aes-256-gcm';
 
+export function validateEncryptionKey(keyBase64: string): void {
+  const key = Buffer.from(keyBase64, 'base64');
+  if (key.length !== 16 && key.length !== 24 && key.length !== 32) {
+    throw new Error(
+      `PARAMETER_ENCRYPTION_KEY must be a base64 string decoding to 16, 24, or 32 bytes; got ${key.length} bytes`
+    );
+  }
+}
+
 export interface EncryptResult {
   encrypted: string;
   iv: string;

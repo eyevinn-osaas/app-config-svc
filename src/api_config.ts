@@ -89,7 +89,13 @@ export const ConfigObjectList = Type.Object({
   offset: Type.Number(),
   limit: Type.Number(),
   total: Type.Number(),
-  items: Type.Array(ConfigObject)
+  items: Type.Array(ConfigObject),
+  skippedKeys: Type.Optional(
+    Type.Number({
+      description:
+        'Number of non-String Valkey keys skipped (shared-store scenario)'
+    })
+  )
 });
 export type ConfigObjectList = Static<typeof ConfigObjectList>;
 
@@ -97,6 +103,19 @@ export const SuccessResponse = Type.Object({
   message: Type.String({ description: 'Success message' })
 });
 export type SuccessResponse = Static<typeof SuccessResponse>;
+
+export const MigrateSecureBody = Type.Object({
+  keys: Type.Optional(Type.Array(Type.String())), // omit → migrate all plaintext keys
+  dryRun: Type.Optional(Type.Boolean())
+});
+export type MigrateSecureBody = Static<typeof MigrateSecureBody>;
+
+export const MigrateSecureResult = Type.Object({
+  migrated: Type.Array(Type.String()),
+  skipped: Type.Array(Type.String()),
+  dryRun: Type.Boolean()
+});
+export type MigrateSecureResult = Static<typeof MigrateSecureResult>;
 
 const SECRET_MASK = '***';
 
@@ -145,10 +164,41 @@ export async function getWithMigration(
   redis: Redis,
   key: string
 ): Promise<string | null> {
-  let value = await redis.get(KEY_PREFIX + key);
+  let value: string | null;
+  try {
+    value = await redis.get(KEY_PREFIX + key);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes('WRONGTYPE')) {
+      console.warn(
+        JSON.stringify({
+          event: 'skippedNonStringKey',
+          key: KEY_PREFIX + key,
+          type: 'unknown'
+        })
+      );
+      return null;
+    }
+    throw err;
+  }
   if (value === null) {
     // Fallback: check for bare key (pre-migration data)
-    value = await redis.get(key);
+    try {
+      value = await redis.get(key);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('WRONGTYPE')) {
+        console.warn(
+          JSON.stringify({
+            event: 'skippedNonStringKey',
+            key,
+            type: 'unknown'
+          })
+        );
+        return null;
+      }
+      throw err;
+    }
     if (value !== null) {
       // Migrate in place: write prefixed, remove bare
       await redis.set(KEY_PREFIX + key, value);
@@ -208,6 +258,17 @@ const apiConfig: FastifyPluginCallback<ApiConfigOptions> = (
             return reply.code(400).send({
               reason:
                 'Encryption not configured: PARAMETER_ENCRYPTION_KEY is required for secret parameters'
+            });
+          }
+          const keyBuf = Buffer.from(opts.encryptionKey, 'base64');
+          if (
+            keyBuf.length !== 16 &&
+            keyBuf.length !== 24 &&
+            keyBuf.length !== 32
+          ) {
+            return reply.code(400).send({
+              reason:
+                'Parameter store encryption key is invalid or not configured correctly. Recreate the parameter store via setup-parameter-store.'
             });
           }
           const { encrypted, iv, tag } = encrypt(value, opts.encryptionKey);
@@ -290,7 +351,21 @@ const apiConfig: FastifyPluginCallback<ApiConfigOptions> = (
                 'Encryption not configured: PARAMETER_ENCRYPTION_KEY is required for secret parameters'
             });
           }
-          const { encrypted, iv, tag } = encrypt(value, opts.encryptionKey);
+          const keyBuf = Buffer.from(opts.encryptionKey as string, 'base64');
+          if (
+            keyBuf.length !== 16 &&
+            keyBuf.length !== 24 &&
+            keyBuf.length !== 32
+          ) {
+            return reply.code(400).send({
+              reason:
+                'Parameter store encryption key is invalid or not configured correctly. Recreate the parameter store via setup-parameter-store.'
+            });
+          }
+          const { encrypted, iv, tag } = encrypt(
+            value,
+            opts.encryptionKey as string
+          );
           const envelope: SecretEnvelope = {
             value: encrypted,
             iv,
@@ -376,10 +451,54 @@ const apiConfig: FastifyPluginCallback<ApiConfigOptions> = (
               : true)
         );
 
+        let skippedKeys = 0;
+
+        // Filter bare keys to String-only in one pipeline round-trip
+        const bareStringKeys: string[] = [];
+        if (bareKeys.length > 0) {
+          const barePipeline = redis.pipeline();
+          for (const bareKey of bareKeys) barePipeline.type(bareKey);
+          const bareTypeResults = (await barePipeline.exec()) ?? [];
+          bareKeys.forEach((bareKey, i) => {
+            const [err, type] = bareTypeResults[i] ?? [null, 'none'];
+            if (err || type !== 'string') {
+              if (!err) {
+                console.warn(
+                  JSON.stringify({
+                    event: 'skippedNonStringKey',
+                    key: bareKey,
+                    type
+                  })
+                );
+                skippedKeys++;
+              }
+              return;
+            }
+            bareStringKeys.push(bareKey);
+          });
+        }
+
         // Migrate bare keys in place and collect their values
         const bareItems: ConfigObject[] = [];
-        for (const bareKey of bareKeys) {
-          const value = await redis.get(bareKey);
+        for (const bareKey of bareStringKeys) {
+          let value: string | null;
+          try {
+            value = await redis.get(bareKey);
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (msg.includes('WRONGTYPE')) {
+              console.warn(
+                JSON.stringify({
+                  event: 'skippedNonStringKey',
+                  key: bareKey,
+                  type: 'unknown-race'
+                })
+              );
+              skippedKeys++;
+              continue;
+            }
+            throw err;
+          }
           if (value !== null) {
             await redis.set(KEY_PREFIX + bareKey, value);
             await redis.del(bareKey);
@@ -391,10 +510,52 @@ const apiConfig: FastifyPluginCallback<ApiConfigOptions> = (
           }
         }
 
+        // Filter prefixed page keys to String-only in one pipeline round-trip
+        const prefixedStringKeys: string[] = [];
+        if (prefixedPageKeys.length > 0) {
+          const prefixedPipeline = redis.pipeline();
+          for (const k of prefixedPageKeys) prefixedPipeline.type(k);
+          const prefixedTypeResults = (await prefixedPipeline.exec()) ?? [];
+          prefixedPageKeys.forEach((k, i) => {
+            const [err, type] = prefixedTypeResults[i] ?? [null, 'none'];
+            if (err || type !== 'string') {
+              if (!err) {
+                console.warn(
+                  JSON.stringify({
+                    event: 'skippedNonStringKey',
+                    key: k,
+                    type
+                  })
+                );
+                skippedKeys++;
+              }
+              return;
+            }
+            prefixedStringKeys.push(k);
+          });
+        }
+
         // Collect values for the prefixed page keys
         const prefixedItems: ConfigObject[] = [];
-        for (const k of prefixedPageKeys) {
-          const value = await redis.get(k);
+        for (const k of prefixedStringKeys) {
+          let value: string | null;
+          try {
+            value = await redis.get(k);
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (msg.includes('WRONGTYPE')) {
+              console.warn(
+                JSON.stringify({
+                  event: 'skippedNonStringKey',
+                  key: k,
+                  type: 'unknown-race'
+                })
+              );
+              skippedKeys++;
+              continue;
+            }
+            throw err;
+          }
           if (value) {
             const itemKey = k.slice(KEY_PREFIX.length);
             prefixedItems.push(
@@ -414,7 +575,8 @@ const apiConfig: FastifyPluginCallback<ApiConfigOptions> = (
           offset: parseInt(newCursor),
           limit: items.length > limit ? items.length : limit,
           total,
-          items
+          items,
+          ...(skippedKeys > 0 ? { skippedKeys } : {})
         });
       } catch (err) {
         errorReply(reply as ErrorReply, err);
@@ -471,6 +633,129 @@ const apiConfig: FastifyPluginCallback<ApiConfigOptions> = (
           .code(200)
           .header('Cache-Control', `max-age=${opts.defaultCacheAge}`)
           .send(result);
+      } catch (error) {
+        errorReply(reply as ErrorReply, error);
+      }
+    }
+  );
+
+  // POST /migrate/secure — bulk re-encrypt all (or specified) plaintext keys
+  fastify.post<{
+    Body: MigrateSecureBody;
+    Reply: MigrateSecureResult | ErrorResponse;
+  }>(
+    '/migrate/secure',
+    {
+      schema: {
+        description:
+          'Migrate plaintext parameters to encrypted envelopes in bulk',
+        body: MigrateSecureBody,
+        response: {
+          200: MigrateSecureResult,
+          400: ErrorResponse,
+          401: ErrorResponse,
+          500: ErrorResponse
+        }
+      }
+    },
+    async (request, reply) => {
+      try {
+        // Auth: require x-config-api-key header
+        if (
+          !hasConfigApiKey(
+            request.headers['x-config-api-key'] as string | undefined,
+            opts.configApiKey
+          )
+        ) {
+          return reply.code(401).send({ reason: 'Unauthorized' });
+        }
+
+        // Require encryption key to be configured
+        if (!opts.encryptionKey) {
+          return reply.code(400).send({
+            reason: 'PARAMETER_ENCRYPTION_KEY is not configured'
+          });
+        }
+
+        const { keys: requestedKeys, dryRun = false } = request.body;
+
+        // Determine which Redis keys to inspect
+        let redisKeys: string[];
+        if (requestedKeys && requestedKeys.length > 0) {
+          // Caller supplied explicit keys — map to prefixed form
+          redisKeys = requestedKeys.map((k) => KEY_PREFIX + k);
+        } else {
+          // SCAN for all keys under the prefix
+          let cursor = '0';
+          redisKeys = [];
+          do {
+            const [nextCursor, batch] = await redis.scan(
+              cursor,
+              'MATCH',
+              KEY_PREFIX + '*',
+              'COUNT',
+              100
+            );
+            redisKeys.push(...batch);
+            cursor = nextCursor;
+          } while (cursor !== '0');
+        }
+
+        const migrated: string[] = [];
+        const skipped: string[] = [];
+
+        for (const redisKey of redisKeys) {
+          const raw = await redis.get(redisKey);
+          if (raw === null) {
+            // Key not found — silently skip
+            continue;
+          }
+
+          const shortKey = redisKey.slice(KEY_PREFIX.length);
+
+          if (isSecretEnvelope(raw)) {
+            skipped.push(shortKey);
+          } else {
+            migrated.push(shortKey);
+            if (!dryRun) {
+              const keyBuf = Buffer.from(
+                opts.encryptionKey as string,
+                'base64'
+              );
+              if (
+                keyBuf.length !== 16 &&
+                keyBuf.length !== 24 &&
+                keyBuf.length !== 32
+              ) {
+                return reply.code(400).send({
+                  reason:
+                    'Parameter store encryption key is invalid or not configured correctly. Recreate the parameter store via setup-parameter-store.'
+                });
+              }
+              const { encrypted, iv, tag } = encrypt(
+                raw,
+                opts.encryptionKey as string
+              );
+              const envelope: SecretEnvelope = {
+                value: encrypted,
+                iv,
+                tag,
+                secret: true
+              };
+              await redis.set(redisKey, JSON.stringify(envelope));
+              console.info(
+                JSON.stringify({
+                  key: shortKey,
+                  secret: true,
+                  action: 'migrate'
+                }),
+                'Parameter migrated to encrypted envelope'
+              );
+            }
+          }
+        }
+
+        reply.code(200).send({ migrated, skipped, dryRun });
       } catch (error) {
         errorReply(reply as ErrorReply, error);
       }
