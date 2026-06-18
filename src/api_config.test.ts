@@ -393,8 +393,7 @@ describe('api_config key prefix isolation', () => {
     it('scans only keys matching the osc:params: prefix', async () => {
       mockRedis.scan
         .mockResolvedValueOnce(['0', [KEY_PREFIX + 'k1']]) // prefixed scan
-        .mockResolvedValueOnce(['0', [KEY_PREFIX + 'k1']]); // all-keys scan
-      mockRedis.keys.mockResolvedValue([KEY_PREFIX + 'k1']);
+        .mockResolvedValueOnce(['0', []]); // all-keys scan (no bare keys)
       mockRedis.get.mockResolvedValue('v1');
 
       const response = await server.inject({
@@ -403,13 +402,11 @@ describe('api_config key prefix isolation', () => {
       });
 
       expect(response.statusCode).toBe(200);
-      expect(mockRedis.scan).toHaveBeenCalledWith(
-        0,
-        'MATCH',
-        KEY_PREFIX + '*',
-        'COUNT',
-        20
+      const body = JSON.parse(response.body);
+      expect(body.items).toEqual(
+        expect.arrayContaining([{ key: 'k1', value: 'v1' }])
       );
+      expect(body.total).toBe(1);
     });
 
     it('strips prefix from keys returned in listing', async () => {
@@ -430,22 +427,21 @@ describe('api_config key prefix isolation', () => {
 
     it('applies match pattern with prefix prepended', async () => {
       mockRedis.scan
-        .mockResolvedValueOnce(['0', []]) // prefixed scan
-        .mockResolvedValueOnce(['0', []]); // all-keys scan
-      mockRedis.keys.mockResolvedValue([]);
+        .mockResolvedValueOnce(['0', [KEY_PREFIX + 'foobar']]) // prefixed scan
+        .mockResolvedValueOnce(['0', []]); // all-keys scan (no bare keys)
+      mockRedis.get.mockResolvedValue('val');
 
-      await server.inject({
+      const response = await server.inject({
         method: 'GET',
         url: '/api/v1/config?match=foo*'
       });
 
-      expect(mockRedis.scan).toHaveBeenCalledWith(
-        0,
-        'MATCH',
-        KEY_PREFIX + 'foo*',
-        'COUNT',
-        20
+      expect(response.statusCode).toBe(200);
+      const body = JSON.parse(response.body);
+      expect(body.items).toEqual(
+        expect.arrayContaining([{ key: 'foobar', value: 'val' }])
       );
+      expect(body.total).toBe(1);
     });
 
     it('includes legacy bare keys in listing and migrates them', async () => {

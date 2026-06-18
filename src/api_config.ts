@@ -422,34 +422,60 @@ const apiConfig: FastifyPluginCallback<ApiConfigOptions> = (
           );
 
         const limit = request.query.limit || 20;
-        const cursor = request.query.offset || 0;
+        const offset = request.query.offset || 0;
         const matchPattern = request.query.match
           ? KEY_PREFIX + request.query.match
           : KEY_PREFIX + '*';
 
-        // Scan for prefixed keys (current format)
-        const [newCursor, prefixedPageKeys] = await redis.scan(
-          cursor,
-          'MATCH',
-          matchPattern,
-          'COUNT',
-          limit
-        );
+        // Iteratively SCAN for ALL prefixed keys matching the pattern.
+        // A single scan() call only inspects ~COUNT hash slots and silently
+        // misses keys in later slots. Iterate until cursor returns to '0'.
+        const allPrefixedKeys: string[] = [];
+        {
+          let scanCursor = '0';
+          do {
+            const [nextCursor, batch] = await redis.scan(
+              scanCursor,
+              'MATCH',
+              matchPattern,
+              'COUNT',
+              100
+            );
+            allPrefixedKeys.push(...batch);
+            scanCursor = nextCursor;
+          } while (scanCursor !== '0');
+        }
 
-        // Scan for bare legacy keys (pre-migration format), excluding anything
-        // that already starts with the prefix
-        const [, allKeys] = await redis.scan(0, 'MATCH', '*', 'COUNT', 1000);
-        const bareKeys = allKeys.filter(
-          (k) =>
-            !k.startsWith(KEY_PREFIX) &&
-            (request.query.match
-              ? k.match(
-                  new RegExp(
-                    '^' + request.query.match.replace(/\*/g, '.*') + '$'
-                  )
-                )
-              : true)
-        );
+        // Iteratively SCAN for ALL keys to find bare legacy keys (pre-migration
+        // format), excluding anything that already starts with the prefix.
+        const bareKeys: string[] = [];
+        {
+          let scanCursor = '0';
+          do {
+            const [nextCursor, batch] = await redis.scan(
+              scanCursor,
+              'MATCH',
+              '*',
+              'COUNT',
+              100
+            );
+            for (const k of batch) {
+              if (
+                !k.startsWith(KEY_PREFIX) &&
+                (request.query.match
+                  ? k.match(
+                      new RegExp(
+                        '^' + request.query.match.replace(/\*/g, '.*') + '$'
+                      )
+                    )
+                  : true)
+              ) {
+                bareKeys.push(k);
+              }
+            }
+            scanCursor = nextCursor;
+          } while (scanCursor !== '0');
+        }
 
         let skippedKeys = 0;
 
@@ -510,13 +536,13 @@ const apiConfig: FastifyPluginCallback<ApiConfigOptions> = (
           }
         }
 
-        // Filter prefixed page keys to String-only in one pipeline round-trip
+        // Filter prefixed keys to String-only in one pipeline round-trip
         const prefixedStringKeys: string[] = [];
-        if (prefixedPageKeys.length > 0) {
+        if (allPrefixedKeys.length > 0) {
           const prefixedPipeline = redis.pipeline();
-          for (const k of prefixedPageKeys) prefixedPipeline.type(k);
+          for (const k of allPrefixedKeys) prefixedPipeline.type(k);
           const prefixedTypeResults = (await prefixedPipeline.exec()) ?? [];
-          prefixedPageKeys.forEach((k, i) => {
+          allPrefixedKeys.forEach((k, i) => {
             const [err, type] = prefixedTypeResults[i] ?? [null, 'none'];
             if (err || type !== 'string') {
               if (!err) {
@@ -535,7 +561,7 @@ const apiConfig: FastifyPluginCallback<ApiConfigOptions> = (
           });
         }
 
-        // Collect values for the prefixed page keys
+        // Collect values for ALL prefixed string keys
         const prefixedItems: ConfigObject[] = [];
         for (const k of prefixedStringKeys) {
           let value: string | null;
@@ -566,18 +592,24 @@ const apiConfig: FastifyPluginCallback<ApiConfigOptions> = (
           }
         }
 
-        // Total: count all prefixed keys (post-migration) plus any remaining bare keys
-        const prefixedKeys = await redis.keys(KEY_PREFIX + '*');
-        const total = prefixedKeys.length;
+        // Combine all items and paginate in memory.
+        // bareItems were already migrated to prefixed keys above, so they appear
+        // as normal prefixed items on subsequent calls.
+        const allItems = [...prefixedItems, ...bareItems];
+        const total = allItems.length;
+        const page = allItems.slice(offset, offset + limit);
+        const nextOffset = offset + limit < total ? offset + limit : 0;
 
-        const items = [...prefixedItems, ...bareItems];
-        reply.code(200).send({
-          offset: parseInt(newCursor),
-          limit: items.length > limit ? items.length : limit,
-          total,
-          items,
-          ...(skippedKeys > 0 ? { skippedKeys } : {})
-        });
+        reply
+          .code(200)
+          .header('Cache-Control', 'no-store')
+          .send({
+            offset: nextOffset,
+            limit,
+            total,
+            items: page,
+            ...(skippedKeys > 0 ? { skippedKeys } : {})
+          });
       } catch (err) {
         errorReply(reply as ErrorReply, err);
       }
