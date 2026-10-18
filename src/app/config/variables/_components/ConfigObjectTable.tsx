@@ -12,15 +12,24 @@ import {
   TableCell,
   TableColumn,
   TableHeader,
-  TableRow
+  TableRow,
+  Tooltip
 } from '@nextui-org/react';
-import { IconCheck, IconPencil, IconTrash, IconX } from '@tabler/icons-react';
+import {
+  IconCheck,
+  IconLock,
+  IconLockOpen,
+  IconPencil,
+  IconTrash,
+  IconX
+} from '@tabler/icons-react';
 import { useEffect, useMemo, useState } from 'react';
 import NewConfigObjectModal from './NewConfigObjectModal';
 import {
   createConfigObject,
   deleteConfigObject,
   getConfigObjectList,
+  markConfigObjectAsSecret,
   updateConfigObject
 } from '@/app/client';
 import { ConfirmationModal } from '@/components/modal/ConfirmationModal';
@@ -31,6 +40,12 @@ export interface ConfigObjectTableProps {
 }
 
 const DEFAULT_PAGE_SIZE = 20;
+
+interface TableItem {
+  keyId: string;
+  value: string;
+  secret?: boolean;
+}
 
 export default function ConfigObjectTable({
   pageSize = DEFAULT_PAGE_SIZE
@@ -44,8 +59,17 @@ export default function ConfigObjectTable({
 
   const apiUrl = useApiUrl();
 
-  const handleSaveEdit = (keyId: string) => {
+  const handleSaveEdit = (item: TableItem) => {
     if (editValue === undefined) {
+      return;
+    }
+
+    // Guard: do not save an empty string for a secret item (the masked '***'
+    // was never a real value the user typed — an empty submit would overwrite
+    // the stored secret with an empty string).
+    if (item.secret && editValue === '') {
+      setEditKeyId(undefined);
+      setEditValue(undefined);
       return;
     }
 
@@ -53,7 +77,12 @@ export default function ConfigObjectTable({
       return;
     }
 
-    updateConfigObject({ apiUrl, keyId, value: editValue })
+    updateConfigObject({
+      apiUrl,
+      keyId: item.keyId,
+      value: editValue,
+      ...(item.secret ? { secret: true } : {})
+    })
       .then(([data, error]) => {
         if (error) {
           console.error(error);
@@ -63,6 +92,26 @@ export default function ConfigObjectTable({
       })
       .finally(() => {
         setEditKeyId(undefined);
+        updateTableContents();
+      });
+  };
+
+  const handleMarkAsSecret = (item: TableItem) => {
+    if (!apiUrl) {
+      return;
+    }
+    markConfigObjectAsSecret({
+      apiUrl,
+      keyId: item.keyId,
+      value: item.value
+    })
+      .then(([, error]) => {
+        if (error) {
+          console.error(error);
+          return;
+        }
+      })
+      .finally(() => {
         updateTableContents();
       });
   };
@@ -97,7 +146,7 @@ export default function ConfigObjectTable({
       apiUrl,
       obj
     })
-      .then(([data, error]) => {
+      .then(([, error]) => {
         if (error) {
           console.error(error);
           return;
@@ -116,7 +165,7 @@ export default function ConfigObjectTable({
       apiUrl,
       key: keyId
     })
-      .then(([data, error]) => {
+      .then(([, error]) => {
         if (error) {
           console.error(error);
           return;
@@ -173,21 +222,36 @@ export default function ConfigObjectTable({
         </TableHeader>
         <TableBody
           items={
-            data?.items.map((obj) => {
-              return { keyId: obj.key, value: obj.value };
-            }) ?? []
+            data?.items.map((obj) => ({
+              keyId: obj.key,
+              value: obj.value,
+              secret: obj.secret
+            })) ?? []
           }
           loadingContent={<Spinner />}
           loadingState={loadingState}
         >
           {(item) => (
             <TableRow key={item.keyId}>
-              <TableCell width="200">{item.keyId}</TableCell>
+              <TableCell width="200">
+                <div className="flex items-center gap-1">
+                  {item.secret && (
+                    <Tooltip content="Stored as encrypted secret">
+                      <span className="text-warning">
+                        <IconLock size={14} />
+                      </span>
+                    </Tooltip>
+                  )}
+                  {item.keyId}
+                </div>
+              </TableCell>
               <TableCell width="400">
                 {editKeyId === item.keyId ? (
                   <Input
                     width="400"
-                    value={editValue ?? item.value}
+                    value={editValue ?? ''}
+                    placeholder={item.secret ? 'Enter new secret value' : ''}
+                    type={item.secret ? 'password' : 'text'}
                     onValueChange={setEditValue}
                   />
                 ) : (
@@ -201,7 +265,10 @@ export default function ConfigObjectTable({
                       isIconOnly
                       color="default"
                       size="sm"
-                      onPress={() => setEditKeyId(item.keyId)}
+                      onPress={() => {
+                        setEditKeyId(item.keyId);
+                        setEditValue(item.secret ? '' : item.value);
+                      }}
                     >
                       <IconPencil />
                     </Button>
@@ -212,7 +279,7 @@ export default function ConfigObjectTable({
                         isIconOnly
                         color="default"
                         size="sm"
-                        onPress={() => handleSaveEdit(item.keyId)}
+                        onPress={() => handleSaveEdit(item)}
                       >
                         <IconCheck />
                       </Button>
@@ -228,6 +295,19 @@ export default function ConfigObjectTable({
                         <IconX />
                       </Button>
                     </>
+                  )}
+                  {!item.secret && editKeyId !== item.keyId && (
+                    <Tooltip content="Mark as secret (irreversible)">
+                      <Button
+                        isIconOnly
+                        color="warning"
+                        variant="flat"
+                        size="sm"
+                        onPress={() => handleMarkAsSecret(item)}
+                      >
+                        <IconLockOpen size={16} />
+                      </Button>
+                    </Tooltip>
                   )}
                   <ClipBoardCopyButton
                     text={apiUrl + '/config/' + item.keyId}

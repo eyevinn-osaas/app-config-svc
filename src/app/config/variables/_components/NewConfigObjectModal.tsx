@@ -7,9 +7,10 @@ import {
   ModalContent,
   ModalFooter,
   ModalHeader,
+  Switch,
   useDisclosure
 } from '@nextui-org/react';
-import { IconPlus } from '@tabler/icons-react';
+import { IconLock, IconPlus } from '@tabler/icons-react';
 import { useState } from 'react';
 
 export interface NewConfigObjectModalProps {
@@ -22,13 +23,23 @@ export default function NewConfigObjectModal({
   const { isOpen, onOpen, onOpenChange } = useDisclosure();
   const [keyId, setKeyId] = useState('');
   const [value, setValue] = useState('');
+  const [isSecret, setIsSecret] = useState(false);
 
   return (
     <>
       <Button color="primary" onPress={onOpen} endContent={<IconPlus />}>
         Add New
       </Button>
-      <Modal isOpen={isOpen} onOpenChange={onOpenChange} size="xl">
+      <Modal
+        isOpen={isOpen}
+        onOpenChange={(open) => {
+          if (!open) {
+            setIsSecret(false);
+          }
+          onOpenChange();
+        }}
+        size="xl"
+      >
         <ModalContent>
           {(onClose) => (
             <>
@@ -45,8 +56,17 @@ export default function NewConfigObjectModal({
                   <Input
                     label="Value"
                     placeholder="Enter variable value"
+                    type={isSecret ? 'password' : 'text'}
                     onValueChange={setValue}
                   />
+                  <Switch
+                    isSelected={isSecret}
+                    onValueChange={setIsSecret}
+                    size="sm"
+                    startContent={<IconLock size={14} />}
+                  >
+                    Store as secret
+                  </Switch>
                 </div>
               </ModalBody>
               <ModalFooter>
@@ -56,7 +76,11 @@ export default function NewConfigObjectModal({
                 <Button
                   color="primary"
                   onPress={() => {
-                    onSave({ key: keyId, value });
+                    onSave({
+                      key: keyId,
+                      value,
+                      ...(isSecret ? { secret: true } : {})
+                    });
                     onClose();
                   }}
                 >
